@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cloudflare IP 简易优选（单文件，仅用 Python 标准库）
-在手机 Termux 里跑：python ip.py
-输出：当前网络下最优的 CF 节点（IP:端口#国家 [速度M]）
+Cloudflare IP 优选（单文件，纯标准库）
+在手机 Termux 运行：python ip.py
+关键：只保留 Cloudflare 官方 IP 段内的地址（过滤数据源里的污染 IP）
 """
 import concurrent.futures as cf
+import ipaddress
 import re
 import socket
 import ssl
@@ -18,12 +19,30 @@ SOURCES = [
     "https://zip.cm.edu.kg/all.txt",
     "https://countrymerge.pages.dev/all.txt",
 ]
+CF_RANGES_URL = "https://www.cloudflare.com/ips-v4"
+# 兜底内置段（官方 ips-v4 拉不到时用）
+CF_RANGES_FALLBACK = """173.245.48.0/20
+103.21.244.0/22
+103.22.200.0/22
+103.31.4.0/22
+141.101.64.0/18
+108.162.192.0/18
+190.93.240.0/20
+188.114.96.0/20
+197.234.240.0/22
+198.41.128.0/17
+162.158.0.0/15
+104.16.0.0/13
+104.24.0.0/14
+172.64.0.0/13
+131.0.72.0/22"""
+
 TCP_TIMEOUT = 2.0
 TCP_WORKERS = 300
-TCP_TOP = 200          # 进测速的候选数（加大，提高命中率）
-SPEED_WORKERS = 10     # 并发提高
-SPEED_SECONDS = 3.5    # 每个节点测速时长
-MIN_BYTES = 65536      # 只要下到 64KB 就算可用（原 256KB 太严）
+TCP_TOP = 200
+SPEED_WORKERS = 10
+SPEED_SECONDS = 3.5
+MIN_BYTES = 65536
 MIN_MBPS = 1.0
 TOP_N = 15
 
@@ -38,7 +57,38 @@ def log(msg):
     print(msg, flush=True)
 
 
-# ── 1. 拉取候选 IP ──
+# ── CF 段表 ──
+def load_cf_ranges():
+    text = ""
+    try:
+        req = urllib.request.Request(CF_RANGES_URL, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            text = r.read().decode("utf-8", "ignore")
+        log(f"  已拉取 CF 官方段表（{len(text.splitlines())} 段）")
+    except Exception as e:
+        log(f"  ⚠ CF 段表拉取失败（{e}），用内置段表")
+        text = CF_RANGES_FALLBACK
+    nets = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(line, strict=False))
+        except Exception:
+            pass
+    return nets
+
+
+def is_cf(ip, nets):
+    try:
+        a = ipaddress.ip_address(ip)
+        return any(a in n for n in nets)
+    except Exception:
+        return False
+
+
+# ── 1. 拉取并过滤候选 ──
 def fetch_source(url, retries=2):
     for i in range(retries + 1):
         try:
@@ -65,24 +115,32 @@ def parse_nodes(text):
 
 def collect():
     log("=" * 60)
-    log("步骤 1/4：拉取候选 IP")
+    log("步骤 1/5：拉取候选 IP + CF 段表校验")
     log("=" * 60)
+    nets = load_cf_ranges()
+
     seen = set()
     nodes = []
+    non_cf = 0
     for url in SOURCES:
         log(f"  请求 {url} ...")
         text = fetch_source(url)
         if not text:
             continue
         got = parse_nodes(text)
-        log(f"    解析出 {len(got)} 个节点")
+        kept = 0
         for ip, port, cc in got:
             key = f"{ip}:{port}"
             if key in seen:
                 continue
             seen.add(key)
+            if not is_cf(ip, nets):
+                non_cf += 1
+                continue
             nodes.append((ip, port, cc))
-    log(f"  合并去重后：{len(nodes)} 个节点")
+            kept += 1
+        log(f"    解析 {len(got)} 个，其中真 CF {kept} 个")
+    log(f"  合并去重后：{len(nodes)} 个真 CF 节点（已剔除 {non_cf} 个非 CF）")
     return nodes
 
 
@@ -106,7 +164,7 @@ def tcp_ping(item):
 def tcp_filter(nodes):
     log("")
     log("=" * 60)
-    log("步骤 2/4：TCP 延迟测试")
+    log("步骤 2/5：TCP 延迟测试")
     log("=" * 60)
     results = []
     done = 0
@@ -118,7 +176,7 @@ def tcp_filter(nodes):
             r = f.result()
             if r:
                 results.append(r)
-            if done % 2000 == 0 or done == total:
+            if done % 1000 == 0 or done == total:
                 log(f"  进度 {done}/{total}，通过 {len(results)}")
     results.sort(key=lambda x: x[3])
     keep = min(TCP_TOP, len(results))
@@ -126,7 +184,7 @@ def tcp_filter(nodes):
     return results[:keep]
 
 
-# ── 3. TLS 握手验证（快速剔除不通的）──
+# ── 3. TLS 握手验证 ──
 def tls_check(item):
     ip, port, cc, ping = item
     try:
@@ -141,18 +199,18 @@ def tls_check(item):
 def tls_filter(items):
     log("")
     log("=" * 60)
-    log("步骤 3/4：TLS 握手验证")
+    log("步骤 3/5：TLS 握手验证")
     log("=" * 60)
     ok = []
     with cf.ThreadPoolExecutor(max_workers=40) as ex:
         for r in ex.map(tls_check, items):
             if r:
                 ok.append(r)
-    log(f"  TLS 握手通过 {len(ok)}/{len(items)} 个")
+    log(f"  TLS 通过 {len(ok)}/{len(items)} 个")
     return ok
 
 
-# ── 4. HTTPS 下载测速 ──
+# ── 4. 测速 ──
 def speed_test(item):
     ip, port, cc, ping = item
     try:
@@ -170,7 +228,6 @@ def speed_test(item):
 
         buf = b""
         header_done = False
-        body_start = 0
         t_start = None
         total_bytes = 0
         deadline = time.time() + SPEED_SECONDS
@@ -190,8 +247,7 @@ def speed_test(item):
                         break
                     continue
                 header_done = True
-                body_start = idx + 4
-                total_bytes = len(buf) - body_start
+                total_bytes = len(buf) - idx - 4
                 t_start = time.time()
                 head = buf[:idx].decode("latin1", "ignore")
                 if " 200 " not in head.split("\r\n")[0]:
@@ -219,7 +275,7 @@ def speed_test(item):
 def speed_filter(items):
     log("")
     log("=" * 60)
-    log(f"步骤 4/4：HTTPS 下载测速（每个 {SPEED_SECONDS} 秒）")
+    log(f"步骤 4/5：HTTPS 下载测速（每个 {SPEED_SECONDS} 秒）")
     log("=" * 60)
     results = []
     done = 0
@@ -240,37 +296,39 @@ def speed_filter(items):
 # ── 5. 输出 ──
 def main():
     t0 = time.time()
+    print(f"CF IP 优选脚本 v3（含段表校验）\n")
+
     nodes = collect()
     if not nodes:
-        log("没有拿到任何节点，检查网络后重试")
+        log("没有真 CF 节点，检查网络/数据源")
         sys.exit(1)
 
     tcp_ok = tcp_filter(nodes)
     if not tcp_ok:
-        log("TCP 全部失败，检查网络")
+        log("TCP 全部失败")
         sys.exit(1)
 
     tls_ok = tls_filter(tcp_ok)
     if not tls_ok:
-        log("TLS 全部失败（可能被限速或封锁）")
+        log("TLS 全部失败")
         sys.exit(1)
 
     speeds = speed_filter(tls_ok)
 
     log("")
     log("=" * 60)
-    log("最终结果")
+    log("步骤 5/5：最终结果")
     log("=" * 60)
 
     good = [r for r in speeds if r[4] >= MIN_MBPS]
     if not good:
-        log(f"⚠ 没有节点达到 {MIN_MBPS} Mbps，下面是实测值：")
+        log(f"⚠ 无节点达到 {MIN_MBPS} Mbps，列出实测值：")
         good = speeds[:TOP_N]
     else:
         good = good[:TOP_N]
 
     if not good:
-        log("没有任何可用节点")
+        log("无可用节点")
         sys.exit(1)
 
     lines = []
@@ -281,7 +339,7 @@ def main():
 
     log("")
     log("=" * 60)
-    log("复制下面这段（可直接粘到 EdgeTunnel / Clash）")
+    log("复制下面这段")
     log("=" * 60)
     for line in lines:
         print(line)
@@ -289,7 +347,7 @@ def main():
     try:
         with open("ip.txt", "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
-        log(f"\n已保存到当前目录 ip.txt（共 {len(lines)} 个节点）")
+        log(f"\n已保存 ip.txt（{len(lines)} 个节点）")
     except Exception as e:
         log(f"\n保存失败: {e}")
 
