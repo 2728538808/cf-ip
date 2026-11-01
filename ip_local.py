@@ -6,14 +6,12 @@ Cloudflare IP 简易优选（单文件，仅用 Python 标准库）
 输出：当前网络下最优的 CF 节点（IP:端口#国家 [速度M]）
 """
 import concurrent.futures as cf
-import json
 import re
 import socket
 import ssl
 import sys
 import time
 import urllib.request
-from collections import defaultdict
 
 # ── 配置 ──
 SOURCES = [
@@ -21,16 +19,16 @@ SOURCES = [
     "https://countrymerge.pages.dev/all.txt",
 ]
 TCP_TIMEOUT = 2.0
-TCP_WORKERS = 200
-TCP_TOP = 60           # 进测速的候选数
-SPEED_WORKERS = 6
-SPEED_SECONDS = 4.0    # 每个节点测速时长
-MIN_MBPS = 1.0         # 低于此速度不算合格
+TCP_WORKERS = 300
+TCP_TOP = 200          # 进测速的候选数（加大，提高命中率）
+SPEED_WORKERS = 10     # 并发提高
+SPEED_SECONDS = 3.5    # 每个节点测速时长
+MIN_BYTES = 65536      # 只要下到 64KB 就算可用（原 256KB 太严）
+MIN_MBPS = 1.0
 TOP_N = 15
 
 UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
 
-# 复用 SSL context
 CTX = ssl.create_default_context()
 CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
@@ -45,7 +43,7 @@ def fetch_source(url, retries=2):
     for i in range(retries + 1):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with urllib.request.urlopen(req, timeout=20) as r:
                 return r.read().decode("utf-8", "ignore")
         except Exception as e:
             if i == retries:
@@ -56,7 +54,6 @@ def fetch_source(url, retries=2):
 
 
 def parse_nodes(text):
-    """解析 IP:端口#国家 格式"""
     out = []
     for line in text.splitlines():
         line = line.strip()
@@ -68,7 +65,7 @@ def parse_nodes(text):
 
 def collect():
     log("=" * 60)
-    log("步骤 1/3：拉取候选 IP")
+    log("步骤 1/4：拉取候选 IP")
     log("=" * 60)
     seen = set()
     nodes = []
@@ -109,7 +106,7 @@ def tcp_ping(item):
 def tcp_filter(nodes):
     log("")
     log("=" * 60)
-    log("步骤 2/3：TCP 延迟测试")
+    log("步骤 2/4：TCP 延迟测试")
     log("=" * 60)
     results = []
     done = 0
@@ -121,16 +118,42 @@ def tcp_filter(nodes):
             r = f.result()
             if r:
                 results.append(r)
-            if done % 500 == 0 or done == total:
+            if done % 2000 == 0 or done == total:
                 log(f"  进度 {done}/{total}，通过 {len(results)}")
     results.sort(key=lambda x: x[3])
-    log(f"  TCP 通过 {len(results)} 个，取延迟最低的 {min(TCP_TOP, len(results))} 个进测速")
-    return results[:TCP_TOP]
+    keep = min(TCP_TOP, len(results))
+    log(f"  TCP 通过 {len(results)} 个，取延迟最低的 {keep} 个进测速")
+    return results[:keep]
 
 
-# ── 3. HTTPS 下载测速 ──
+# ── 3. TLS 握手验证（快速剔除不通的）──
+def tls_check(item):
+    ip, port, cc, ping = item
+    try:
+        sock = socket.create_connection((ip, port), timeout=4)
+        ss = CTX.wrap_socket(sock, server_hostname="speed.cloudflare.com")
+        ss.close()
+        return item
+    except Exception:
+        return None
+
+
+def tls_filter(items):
+    log("")
+    log("=" * 60)
+    log("步骤 3/4：TLS 握手验证")
+    log("=" * 60)
+    ok = []
+    with cf.ThreadPoolExecutor(max_workers=40) as ex:
+        for r in ex.map(tls_check, items):
+            if r:
+                ok.append(r)
+    log(f"  TLS 握手通过 {len(ok)}/{len(items)} 个")
+    return ok
+
+
+# ── 4. HTTPS 下载测速 ──
 def speed_test(item):
-    """经该 IP 下载 Cloudflare 测速文件，返回 Mbps"""
     ip, port, cc, ping = item
     try:
         sock = socket.create_connection((ip, port), timeout=5)
@@ -170,7 +193,6 @@ def speed_test(item):
                 body_start = idx + 4
                 total_bytes = len(buf) - body_start
                 t_start = time.time()
-                # 检查状态码
                 head = buf[:idx].decode("latin1", "ignore")
                 if " 200 " not in head.split("\r\n")[0]:
                     ss.close()
@@ -183,7 +205,7 @@ def speed_test(item):
         except Exception:
             pass
 
-        if not t_start or total_bytes < 262144:  # 至少 256KB
+        if not t_start or total_bytes < MIN_BYTES:
             return None
         dur = time.time() - t_start
         if dur <= 0.2:
@@ -197,7 +219,7 @@ def speed_test(item):
 def speed_filter(items):
     log("")
     log("=" * 60)
-    log(f"步骤 3/3：HTTPS 下载测速（每个测 {SPEED_SECONDS} 秒）")
+    log(f"步骤 4/4：HTTPS 下载测速（每个 {SPEED_SECONDS} 秒）")
     log("=" * 60)
     results = []
     done = 0
@@ -209,12 +231,13 @@ def speed_filter(items):
             r = f.result()
             if r:
                 results.append(r)
-            log(f"  进度 {done}/{total}，有效 {len(results)}")
+            if done % 20 == 0 or done == total:
+                log(f"  进度 {done}/{total}，有效 {len(results)}")
     results.sort(key=lambda x: -x[4])
     return results
 
 
-# ── 4. 输出 ──
+# ── 5. 输出 ──
 def main():
     t0 = time.time()
     nodes = collect()
@@ -227,7 +250,12 @@ def main():
         log("TCP 全部失败，检查网络")
         sys.exit(1)
 
-    speeds = speed_filter(tcp_ok)
+    tls_ok = tls_filter(tcp_ok)
+    if not tls_ok:
+        log("TLS 全部失败（可能被限速或封锁）")
+        sys.exit(1)
+
+    speeds = speed_filter(tls_ok)
 
     log("")
     log("=" * 60)
@@ -258,7 +286,6 @@ def main():
     for line in lines:
         print(line)
 
-    # 同时存文件
     try:
         with open("ip.txt", "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
